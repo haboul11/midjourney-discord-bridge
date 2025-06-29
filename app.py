@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
 Midjourney Discord Bridge - Render.com Deployment Version
+Fixed asyncio event loop issues for production deployment
 """
 
 import os
-import discord
-from discord.ext import commands
+import sys
 import asyncio
 import json
-from flask import Flask, request, jsonify
-import threading
 import time
 import re
+import threading
 from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+
+# Handle discord.py import with fallback
+try:
+    import discord
+    from discord.ext import commands
+    DISCORD_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Discord import failed: {e}")
+    DISCORD_AVAILABLE = False
 
 # Configuration from environment variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -27,14 +36,20 @@ DEBUG_MODE = os.getenv('DEBUG_MODE', 'True').lower() == 'true'
 app = Flask(__name__)
 
 # Discord bot setup
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+if DISCORD_AVAILABLE:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+    bot = commands.Bot(command_prefix='!', intents=intents)
+else:
+    bot = None
 
 # Storage for tasks
 pending_tasks = {}
 completed_tasks = {}
+
+# Global event loop for async operations
+discord_loop = None
 
 class MidjourneyBridge:
     def __init__(self):
@@ -44,6 +59,10 @@ class MidjourneyBridge:
     async def setup(self):
         """Initialize the bot and get the channel"""
         try:
+            if not DISCORD_AVAILABLE or not bot:
+                print("❌ Discord not available")
+                return False
+                
             await bot.wait_until_ready()
             self.channel = bot.get_channel(CHANNEL_ID)
             
@@ -168,6 +187,16 @@ class MidjourneyBridge:
 # Initialize bridge
 bridge = MidjourneyBridge()
 
+def run_async_in_thread(coro):
+    """Run async function in the Discord thread"""
+    global discord_loop
+    if discord_loop and not discord_loop.is_closed():
+        future = asyncio.run_coroutine_threadsafe(coro, discord_loop)
+        return future
+    else:
+        print("❌ Discord loop not available")
+        return None
+
 # Flask routes
 @app.route('/', methods=['GET'])
 def home():
@@ -181,7 +210,9 @@ def home():
         
         <h3>Status</h3>
         <p><strong>Bot Ready:</strong> {'✅ Yes' if bridge.ready else '❌ No'}</p>
-        <p><strong>Discord Connected:</strong> {'✅ Yes' if bot.is_ready() else '❌ No'}</p>
+        <p><strong>Discord Connected:</strong> {'✅ Yes' if bot and bot.is_ready() else '❌ No'}</p>
+        <p><strong>Discord Available:</strong> {'✅ Yes' if DISCORD_AVAILABLE else '❌ No'}</p>
+        <p><strong>Event Loop:</strong> {'✅ Active' if discord_loop and not discord_loop.is_closed() else '❌ Not Active'}</p>
         <p><strong>Pending Tasks:</strong> {len(pending_tasks)}</p>
         <p><strong>Completed Tasks:</strong> {len(completed_tasks)}</p>
         
@@ -204,6 +235,18 @@ POST /generate
     "task_id": "test123"
 }}
         </pre>
+        
+        <h3>Recent Activity</h3>
+        <ul>
+    """
+    
+    # Show recent completed tasks
+    recent_tasks = list(completed_tasks.items())[-5:]  # Last 5 tasks
+    for task_id, task_info in recent_tasks:
+        status_html += f"<li>{task_id}: {task_info['status']} - {len(task_info.get('image_urls', []))} images</li>"
+    
+    status_html += """
+        </ul>
     </body>
     </html>
     """
@@ -223,12 +266,18 @@ def generate_image():
         if not bridge.ready:
             return jsonify({'error': 'Discord bot not ready'}), 503
         
+        if not DISCORD_AVAILABLE:
+            return jsonify({'error': 'Discord not available'}), 503
+            
         print(f"\n📥 NEW REQUEST")
         print(f"🆔 Task ID: {task_id}")
         print(f"📝 Prompt: {prompt}")
         
-        # Process request asynchronously
-        asyncio.create_task(process_generation_request(prompt, task_id))
+        # Process request using the Discord thread
+        future = run_async_in_thread(process_generation_request(prompt, task_id))
+        
+        if future is None:
+            return jsonify({'error': 'Could not process request - Discord loop not available'}), 503
         
         return jsonify({
             'success': True,
@@ -279,8 +328,10 @@ def health_check():
     """Health check"""
     return jsonify({
         'status': 'healthy',
-        'bot_ready': bot.is_ready(),
+        'bot_ready': bot.is_ready() if bot else False,
         'bridge_ready': bridge.ready,
+        'discord_available': DISCORD_AVAILABLE,
+        'event_loop_active': discord_loop is not None and not discord_loop.is_closed() if discord_loop else False,
         'pending_tasks': len(pending_tasks),
         'completed_tasks': len(completed_tasks),
         'deployment': 'render.com'
@@ -289,9 +340,12 @@ def health_check():
 async def process_generation_request(prompt, task_id):
     """Process generation request"""
     try:
+        print(f"🔄 Processing generation request for {task_id}")
+        
         success = await bridge.send_imagine_command(prompt, task_id)
         
         if success:
+            print(f"✅ Command sent for {task_id}, waiting for response...")
             image_urls = await bridge.wait_for_response(task_id)
             
             if image_urls:
@@ -305,37 +359,46 @@ async def process_generation_request(prompt, task_id):
         print(f"❌ Error processing {task_id}: {e}")
 
 # Discord bot events
-@bot.event
-async def on_ready():
-    """Bot ready event"""
-    print(f'\n🤖 Discord bot logged in as {bot.user}')
-    print(f"🆔 Bot ID: {bot.user.id}")
-    print(f"🏢 Connected to {len(bot.guilds)} server(s)")
-    
-    success = await bridge.setup()
-    
-    if success:
-        print(f"✅ Bridge ready on Render.com!")
-    else:
-        print(f"❌ Bridge setup failed!")
+if DISCORD_AVAILABLE and bot:
+    @bot.event
+    async def on_ready():
+        """Bot ready event"""
+        global discord_loop
+        discord_loop = asyncio.get_event_loop()
+        
+        print(f'\n🤖 Discord bot logged in as {bot.user}')
+        print(f"🆔 Bot ID: {bot.user.id}")
+        print(f"🏢 Connected to {len(bot.guilds)} server(s)")
+        
+        success = await bridge.setup()
+        
+        if success:
+            print(f"✅ Bridge ready on Render.com!")
+            print(f"🔄 Event loop: {discord_loop}")
+        else:
+            print(f"❌ Bridge setup failed!")
 
-@bot.event
-async def on_message(message):
-    """Handle incoming messages"""
-    if DEBUG_MODE and message.author.id == MIDJOURNEY_USER_ID:
-        print(f"📨 Midjourney message: {message.content[:50]}...")
-        if message.attachments:
-            print(f"   📎 {len(message.attachments)} attachments")
-    
-    await bot.process_commands(message)
+    @bot.event
+    async def on_message(message):
+        """Handle incoming messages"""
+        if DEBUG_MODE and message.author.id == MIDJOURNEY_USER_ID:
+            print(f"📨 Midjourney message: {message.content[:50]}...")
+            if message.attachments:
+                print(f"   📎 {len(message.attachments)} attachments")
+        
+        await bot.process_commands(message)
 
 def run_flask():
     """Run Flask server"""
     print(f"🌐 Starting Flask server on {FLASK_HOST}:{FLASK_PORT}")
-    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, use_reloader=False)
 
 def run_bot():
     """Run Discord bot"""
+    if not DISCORD_AVAILABLE:
+        print("❌ Discord not available - running Flask only")
+        return
+        
     if not DISCORD_TOKEN:
         print("❌ DISCORD_TOKEN environment variable not set")
         return
@@ -345,13 +408,24 @@ def run_bot():
         return
     
     print("🤖 Starting Discord bot...")
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception as e:
+        print(f"❌ Failed to start Discord bot: {e}")
 
 def main():
     """Main function for Render deployment"""
     print("=" * 50)
     print("🚀 MIDJOURNEY BRIDGE - RENDER DEPLOYMENT")
     print("=" * 50)
+    print(f"🔧 Discord Available: {DISCORD_AVAILABLE}")
+    print(f"🔧 Token Set: {bool(DISCORD_TOKEN)}")
+    print(f"🔧 Channel ID: {CHANNEL_ID}")
+    
+    if not DISCORD_AVAILABLE:
+        print("⚠️ Running in Flask-only mode")
+        run_flask()
+        return
     
     # Start Flask in separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
