@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: midjourney-bridge
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
