@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Midjourney Discord Bridge - Render.com Deployment Version
-Fixed to use proper Discord slash commands instead of text messages
+Fixed asyncio event loop issues and proper Midjourney command format
 """
 
 import os
@@ -29,7 +29,7 @@ CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 FLASK_HOST = "0.0.0.0"
 FLASK_PORT = int(os.getenv('PORT', '5000'))
 MIDJOURNEY_USER_ID = 936929561302675456
-MAX_WAIT_MINUTES = 10
+MAX_WAIT_MINUTES = 15  # Increased wait time
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'True').lower() == 'true'
 
 # Flask app
@@ -55,7 +55,6 @@ class MidjourneyBridge:
     def __init__(self):
         self.channel = None
         self.ready = False
-        self.midjourney_app_id = None
         
     async def setup(self):
         """Initialize the bot and get the channel"""
@@ -71,12 +70,8 @@ class MidjourneyBridge:
                 print(f"❌ Could not find channel with ID: {CHANNEL_ID}")
                 return False
                 
-            # Get Midjourney bot's application ID
-            await self.find_midjourney_app_id()
-                
             print(f"✅ Connected to channel: {self.channel.name}")
             print(f"🏢 Server: {self.channel.guild.name}")
-            print(f"🤖 Midjourney App ID: {self.midjourney_app_id}")
             self.ready = True
             return True
             
@@ -84,33 +79,15 @@ class MidjourneyBridge:
             print(f"❌ Setup error: {e}")
             return False
 
-    async def find_midjourney_app_id(self):
-        """Find Midjourney bot's application ID for slash commands"""
-        try:
-            # Look through guild members to find Midjourney bot
-            guild = self.channel.guild
-            midjourney_member = guild.get_member(MIDJOURNEY_USER_ID)
-            
-            if midjourney_member and midjourney_member.bot:
-                # For bots, the application ID is usually the same as user ID
-                self.midjourney_app_id = MIDJOURNEY_USER_ID
-                print(f"🔍 Found Midjourney bot: {midjourney_member.display_name}")
-            else:
-                print("⚠️ Could not find Midjourney bot in guild members")
-                self.midjourney_app_id = MIDJOURNEY_USER_ID  # Fallback
-                
-        except Exception as e:
-            print(f"❌ Error finding Midjourney app ID: {e}")
-            self.midjourney_app_id = MIDJOURNEY_USER_ID  # Fallback
-
     async def send_imagine_command(self, prompt, task_id):
-        """Send /imagine slash command to Discord using interaction"""
+        """Send /imagine command to Discord with proper format"""
         try:
             if not self.ready or not self.channel:
                 print("❌ Bot not ready or channel not found")
                 return False
                 
-            print(f"🎨 Sending imagine slash command for task {task_id}")
+            print(f"🎨 Sending imagine command for task {task_id}")
+            print(f"📝 Prompt: {prompt}")
             
             # Store task info
             pending_tasks[task_id] = {
@@ -122,196 +99,141 @@ class MidjourneyBridge:
                 'image_urls': []
             }
             
-            # Create the slash command interaction
-            try:
-                # Method 1: Try to use the slash command through the channel
-                await self.send_slash_command_interaction(prompt, task_id)
+            # Try multiple command formats for better Midjourney compatibility
+            command_formats = [
+                f"/imagine prompt: {prompt}",  # Correct Midjourney format
+                f"/imagine {prompt}",          # Alternative format
+                f"<@{MIDJOURNEY_USER_ID}> /imagine prompt: {prompt}",  # With mention
+            ]
+            
+            message = None
+            successful_format = None
+            
+            for i, command_text in enumerate(command_formats):
+                try:
+                    print(f"🔄 Trying format {i+1}: {command_text[:50]}...")
+                    message = await self.channel.send(command_text)
+                    successful_format = command_text
+                    print(f"✅ Successfully sent format {i+1}")
+                    break
+                except Exception as e:
+                    print(f"❌ Format {i+1} failed: {e}")
+                    # Wait a bit before trying next format
+                    await asyncio.sleep(1)
+                    continue
+            
+            if message:
+                pending_tasks[task_id]['command_message_id'] = message.id
+                pending_tasks[task_id]['status'] = 'waiting_for_response'
+                pending_tasks[task_id]['command_used'] = successful_format
                 
-            except Exception as slash_error:
-                print(f"⚠️ Slash command failed, trying alternative method: {slash_error}")
-                # Method 2: Fallback to webhook-style command
-                await self.send_webhook_command(prompt, task_id)
-            
-            pending_tasks[task_id]['status'] = 'waiting_for_response'
-            print(f"✅ Command sent for task {task_id}!")
-            return True
-            
+                print(f"✅ Command sent successfully!")
+                print(f"📨 Message ID: {message.id}")
+                print(f"📝 Format used: {successful_format}")
+                return True
+            else:
+                print("❌ All command formats failed")
+                pending_tasks[task_id]['status'] = 'failed'
+                return False
+                
         except Exception as e:
             print(f"❌ Error sending command: {e}")
             if task_id in pending_tasks:
                 pending_tasks[task_id]['status'] = 'error'
             return False
 
-    async def send_slash_command_interaction(self, prompt, task_id):
-        """Send slash command using Discord interactions"""
-        try:
-            # Create interaction data for /imagine command
-            interaction_data = {
-                "type": 2,  # APPLICATION_COMMAND
-                "application_id": str(self.midjourney_app_id),
-                "guild_id": str(self.channel.guild.id),
-                "channel_id": str(self.channel.id),
-                "session_id": "placeholder_session_id",
-                "data": {
-                    "version": "1166847114203123795",  # Midjourney's imagine command version
-                    "id": "938956540159881230",  # Midjourney's imagine command ID
-                    "name": "imagine",
-                    "type": 1,  # CHAT_INPUT
-                    "options": [
-                        {
-                            "type": 3,  # STRING
-                            "name": "prompt",
-                            "value": prompt
-                        }
-                    ]
-                }
-            }
-            
-            # Send the interaction through Discord's HTTP API
-            import aiohttp
-            
-            headers = {
-                "Authorization": f"Bot {DISCORD_TOKEN}",
-                "Content-Type": "application/json"
-            }
-            
-            url = f"https://discord.com/api/v10/interactions"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=interaction_data, headers=headers) as response:
-                    if response.status == 200:
-                        print(f"✅ Slash command interaction sent successfully")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        print(f"❌ Interaction failed: {response.status} - {error_text}")
-                        raise Exception(f"Interaction failed: {response.status}")
-                        
-        except Exception as e:
-            print(f"❌ Slash command interaction error: {e}")
-            raise e
-
-    async def send_webhook_command(self, prompt, task_id):
-        """Alternative method: Send command through webhook simulation"""
-        try:
-            # This method tries to trigger the slash command by mentioning the bot
-            # and using a format that might trigger the slash command
-            
-            # Try to get slash commands available in the guild
-            guild = self.channel.guild
-            commands = await guild.fetch_commands()
-            
-            imagine_command = None
-            for cmd in commands:
-                if cmd.name == "imagine" and cmd.application_id == self.midjourney_app_id:
-                    imagine_command = cmd
-                    break
-            
-            if imagine_command:
-                print(f"🔍 Found imagine command: {imagine_command.id}")
-                
-                # Try to invoke the command using Discord's application command system
-                # This is a more direct approach but requires proper permissions
-                
-                # Create a mock interaction
-                mock_interaction = discord.Interaction(
-                    data={
-                        "id": "mock_interaction_id",
-                        "type": 2,
-                        "data": {
-                            "id": str(imagine_command.id),
-                            "name": "imagine",
-                            "options": [{"name": "prompt", "value": prompt}]
-                        },
-                        "guild_id": str(guild.id),
-                        "channel_id": str(self.channel.id),
-                        "member": {
-                            "user": {
-                                "id": str(bot.user.id),
-                                "username": bot.user.name
-                            }
-                        },
-                        "token": "mock_token"
-                    },
-                    state=bot._connection
-                )
-                
-                # This might not work directly, but it's worth trying
-                await imagine_command.callback(mock_interaction, prompt=prompt)
-                
-            else:
-                # Last resort: send a message that looks like a slash command
-                # This usually doesn't work but is included for completeness
-                message = await self.channel.send(f"</imagine:{imagine_command.id if imagine_command else '938956540159881230'}:1166847114203123795> {prompt}")
-                pending_tasks[task_id]['command_message_id'] = message.id
-                
-        except Exception as e:
-            print(f"❌ Webhook command error: {e}")
-            # Final fallback - send as regular message (won't work but for debugging)
-            message = await self.channel.send(f"/imagine {prompt}")
-            pending_tasks[task_id]['command_message_id'] = message.id
-
     async def wait_for_response(self, task_id):
-        """Wait for Midjourney to respond"""
+        """Wait for Midjourney to respond with improved detection"""
         try:
             if task_id not in pending_tasks:
+                print(f"❌ Task {task_id} not found in pending tasks")
                 return None
                 
             task_info = pending_tasks[task_id]
-            prompt_words = task_info['prompt'].lower().split()[:5]
+            prompt_words = task_info['prompt'].lower().split()
+            
+            # Use more specific keywords for matching
+            key_words = []
+            for word in prompt_words[:8]:  # Use first 8 words
+                if len(word) > 3:  # Only words longer than 3 characters
+                    key_words.append(word)
             
             print(f"🔍 Monitoring for response to task {task_id}")
+            print(f"🔍 Looking for keywords: {key_words}")
             
             timeout = datetime.now() + timedelta(minutes=MAX_WAIT_MINUTES)
-            check_interval = 5
+            check_interval = 8  # Check every 8 seconds
             
             while datetime.now() < timeout:
                 try:
+                    # Get recent messages since task creation
                     messages = []
-                    async for message in self.channel.history(limit=20, after=task_info['created_at']):
+                    async for message in self.channel.history(limit=30, after=task_info['created_at']):
                         messages.append(message)
                     
+                    # Look for Midjourney responses
                     for message in messages:
+                        # Check if message is from Midjourney
                         if message.author.id != MIDJOURNEY_USER_ID:
                             continue
-                            
+                        
+                        # Check if message has attachments (images)
                         if not message.attachments:
                             continue
                             
                         message_content = message.content.lower()
-                        matches = sum(1 for word in prompt_words if word in message_content)
                         
-                        if matches >= 2:
-                            print(f"🎯 Found matching message from Midjourney!")
+                        # Check for keyword matches
+                        matches = 0
+                        for keyword in key_words:
+                            if keyword in message_content:
+                                matches += 1
+                        
+                        # If we have enough matches, this is likely our response
+                        if matches >= 2 or len(key_words) <= 2:
+                            print(f"🎯 Found potential matching message from Midjourney!")
+                            print(f"📨 Message content: {message.content[:100]}...")
+                            print(f"🔍 Keyword matches: {matches}/{len(key_words)}")
                             
+                            # Extract image URLs from attachments
                             image_urls = []
                             for attachment in message.attachments:
                                 if any(ext in attachment.filename.lower() for ext in ['.png', '.jpg', '.jpeg', '.webp']):
                                     image_urls.append(attachment.url)
                             
                             if image_urls:
+                                # Task completed successfully!
                                 completed_tasks[task_id] = {
                                     'status': 'completed',
                                     'prompt': task_info['prompt'],
                                     'image_urls': image_urls,
                                     'discord_message_id': message.id,
-                                    'completed_at': datetime.now()
+                                    'completed_at': datetime.now(),
+                                    'keyword_matches': matches
                                 }
                                 
+                                # Update pending task
                                 pending_tasks[task_id]['status'] = 'completed'
                                 pending_tasks[task_id]['response_message_id'] = message.id
                                 pending_tasks[task_id]['image_urls'] = image_urls
                                 
-                                print(f"✅ Task {task_id} completed! Found {len(image_urls)} images")
+                                print(f"✅ Task {task_id} completed successfully!")
+                                print(f"🖼️ Found {len(image_urls)} images:")
+                                for i, url in enumerate(image_urls):
+                                    print(f"   {i+1}. {url}")
+                                
                                 return image_urls
                     
+                    # No matching message found yet, wait and check again
+                    print(f"⏳ Still waiting... {datetime.now().strftime('%H:%M:%S')}")
                     await asyncio.sleep(check_interval)
                     
                 except Exception as e:
                     print(f"❌ Error while monitoring: {e}")
                     await asyncio.sleep(check_interval)
             
-            print(f"⏰ Timeout reached for task {task_id}")
+            # Timeout reached
+            print(f"⏰ Timeout reached for task {task_id} after {MAX_WAIT_MINUTES} minutes")
             if task_id in pending_tasks:
                 pending_tasks[task_id]['status'] = 'timeout'
             
@@ -340,22 +262,22 @@ def home():
     """Home page with status"""
     status_html = f"""
     <html>
-    <head><title>Midjourney Bridge - Render Deployment (Fixed Slash Commands)</title></head>
+    <head><title>Midjourney Bridge - Render Deployment</title></head>
     <body style="font-family: Arial, sans-serif; margin: 40px;">
         <h1>🤖 Midjourney Discord Bridge</h1>
-        <h2>🌐 Deployed on Render.com (Fixed for Slash Commands)</h2>
+        <h2>🌐 Deployed on Render.com</h2>
         
         <h3>Status</h3>
         <p><strong>Bot Ready:</strong> {'✅ Yes' if bridge.ready else '❌ No'}</p>
         <p><strong>Discord Connected:</strong> {'✅ Yes' if bot and bot.is_ready() else '❌ No'}</p>
         <p><strong>Discord Available:</strong> {'✅ Yes' if DISCORD_AVAILABLE else '❌ No'}</p>
         <p><strong>Event Loop:</strong> {'✅ Active' if discord_loop and not discord_loop.is_closed() else '❌ Not Active'}</p>
-        <p><strong>Midjourney App ID:</strong> {bridge.midjourney_app_id}</p>
         <p><strong>Pending Tasks:</strong> {len(pending_tasks)}</p>
         <p><strong>Completed Tasks:</strong> {len(completed_tasks)}</p>
         
         <h3>Configuration</h3>
         <p><strong>Channel ID:</strong> {CHANNEL_ID}</p>
+        <p><strong>Max Wait Time:</strong> {MAX_WAIT_MINUTES} minutes</p>
         <p><strong>Debug Mode:</strong> {DEBUG_MODE}</p>
         
         <h3>API Endpoints</h3>
@@ -365,14 +287,12 @@ def home():
             <li><code>GET /health</code> - Health check</li>
         </ul>
         
-        <h3>Example Request</h3>
-        <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
-POST /generate
-{{
-    "prompt": "beautiful sunset over mountains",
-    "task_id": "test123"
-}}
-        </pre>
+        <h3>Command Formats Supported</h3>
+        <ul>
+            <li><code>/imagine prompt: [description]</code> (Primary)</li>
+            <li><code>/imagine [description]</code> (Fallback)</li>
+            <li><code>@Midjourney /imagine prompt: [description]</code> (With mention)</li>
+        </ul>
         
         <h3>Recent Activity</h3>
         <ul>
@@ -381,17 +301,20 @@ POST /generate
     # Show recent completed tasks
     recent_tasks = list(completed_tasks.items())[-5:]  # Last 5 tasks
     for task_id, task_info in recent_tasks:
-        status_html += f"<li>{task_id}: {task_info['status']} - {len(task_info.get('image_urls', []))} images</li>"
+        status_html += f"<li><strong>{task_id}:</strong> {task_info['status']} - {len(task_info.get('image_urls', []))} images</li>"
     
     status_html += """
         </ul>
         
-        <h3>⚠️ Important Notes</h3>
+        <h3>Pending Tasks</h3>
         <ul>
-            <li>This version uses proper Discord slash command interactions</li>
-            <li>Requires aiohttp library: <code>pip install aiohttp</code></li>
-            <li>Bot needs proper permissions in the Discord server</li>
-            <li>May require additional setup for slash command access</li>
+    """
+    
+    # Show current pending tasks
+    for task_id, task_info in pending_tasks.items():
+        status_html += f"<li><strong>{task_id}:</strong> {task_info['status']} (Created: {task_info['created_at'].strftime('%H:%M:%S')})</li>"
+    
+    status_html += """
         </ul>
     </body>
     </html>
@@ -415,9 +338,10 @@ def generate_image():
         if not DISCORD_AVAILABLE:
             return jsonify({'error': 'Discord not available'}), 503
             
-        print(f"\n📥 NEW REQUEST")
+        print(f"\n📥 NEW GENERATION REQUEST")
         print(f"🆔 Task ID: {task_id}")
         print(f"📝 Prompt: {prompt}")
+        print(f"⏰ Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Process request using the Discord thread
         future = run_async_in_thread(process_generation_request(prompt, task_id))
@@ -429,7 +353,8 @@ def generate_image():
             'success': True,
             'task_id': task_id,
             'status': 'submitted',
-            'message': 'Generation request submitted to Discord using slash command'
+            'message': 'Generation request submitted to Discord',
+            'max_wait_minutes': MAX_WAIT_MINUTES
         })
         
     except Exception as e:
@@ -440,6 +365,7 @@ def generate_image():
 def check_status(task_id):
     """Check task status"""
     try:
+        # Check completed tasks first
         if task_id in completed_tasks:
             task_info = completed_tasks[task_id]
             return jsonify({
@@ -447,18 +373,25 @@ def check_status(task_id):
                 'task_id': task_id,
                 'image_urls': task_info['image_urls'],
                 'discord_message_id': task_info.get('discord_message_id'),
-                'completed_at': task_info['completed_at'].isoformat()
+                'completed_at': task_info['completed_at'].isoformat(),
+                'total_images': len(task_info['image_urls']),
+                'keyword_matches': task_info.get('keyword_matches', 0)
             })
         
+        # Check pending tasks
         if task_id in pending_tasks:
             task_info = pending_tasks[task_id]
+            elapsed_minutes = (datetime.now() - task_info['created_at']).total_seconds() / 60
             return jsonify({
                 'status': task_info['status'],
                 'task_id': task_id,
                 'created_at': task_info['created_at'].isoformat(),
-                'message': f"Task is {task_info['status']}"
+                'elapsed_minutes': round(elapsed_minutes, 1),
+                'max_wait_minutes': MAX_WAIT_MINUTES,
+                'message': f"Task is {task_info['status']} ({elapsed_minutes:.1f}/{MAX_WAIT_MINUTES} min)"
             })
         
+        # Task not found
         return jsonify({
             'status': 'not_found',
             'task_id': task_id,
@@ -480,8 +413,9 @@ def health_check():
         'event_loop_active': discord_loop is not None and not discord_loop.is_closed() if discord_loop else False,
         'pending_tasks': len(pending_tasks),
         'completed_tasks': len(completed_tasks),
-        'deployment': 'render.com',
-        'slash_commands': 'enabled'
+        'max_wait_minutes': MAX_WAIT_MINUTES,
+        'midjourney_user_id': MIDJOURNEY_USER_ID,
+        'deployment': 'render.com'
     })
 
 async def process_generation_request(prompt, task_id):
@@ -489,18 +423,27 @@ async def process_generation_request(prompt, task_id):
     try:
         print(f"🔄 Processing generation request for {task_id}")
         
+        # Send the imagine command
         success = await bridge.send_imagine_command(prompt, task_id)
         
         if success:
-            print(f"✅ Slash command sent for {task_id}, waiting for response...")
+            print(f"✅ Command sent for {task_id}, waiting for Midjourney response...")
+            
+            # Wait for Midjourney to respond
             image_urls = await bridge.wait_for_response(task_id)
             
             if image_urls:
-                print(f"✅ Generation successful for {task_id}")
+                print(f"✅ Generation successful for {task_id}!")
+                print(f"🖼️ Received {len(image_urls)} images")
             else:
                 print(f"❌ No images received for {task_id}")
+                print("💡 This could mean:")
+                print("   - Midjourney didn't respond (check Discord)")
+                print("   - Command format wasn't recognized")
+                print("   - Prompt was rejected by Midjourney")
+                print("   - Response detection failed")
         else:
-            print(f"❌ Failed to send slash command for {task_id}")
+            print(f"❌ Failed to send command for {task_id}")
             
     except Exception as e:
         print(f"❌ Error processing {task_id}: {e}")
@@ -517,29 +460,37 @@ if DISCORD_AVAILABLE and bot:
         print(f"🆔 Bot ID: {bot.user.id}")
         print(f"🏢 Connected to {len(bot.guilds)} server(s)")
         
+        # List all servers for debugging
+        for guild in bot.guilds:
+            print(f"   - {guild.name} (ID: {guild.id})")
+        
         success = await bridge.setup()
         
         if success:
-            print(f"✅ Bridge ready on Render.com with slash command support!")
+            print(f"✅ Bridge ready on Render.com!")
             print(f"🔄 Event loop: {discord_loop}")
+            print(f"⏰ Max wait time: {MAX_WAIT_MINUTES} minutes")
+            print(f"🎯 Target Midjourney User ID: {MIDJOURNEY_USER_ID}")
         else:
             print(f"❌ Bridge setup failed!")
 
     @bot.event
     async def on_message(message):
-        """Handle incoming messages"""
+        """Handle incoming messages with enhanced logging"""
         if DEBUG_MODE and message.author.id == MIDJOURNEY_USER_ID:
-            print(f"📨 Midjourney message: {message.content[:50]}...")
+            print(f"📨 Midjourney message detected:")
+            print(f"   Content: {message.content[:100]}...")
+            print(f"   Attachments: {len(message.attachments)}")
             if message.attachments:
-                print(f"   📎 {len(message.attachments)} attachments")
+                for i, att in enumerate(message.attachments):
+                    print(f"      {i+1}. {att.filename} ({att.url})")
         
         await bot.process_commands(message)
 
     @bot.event
-    async def on_application_command(interaction):
-        """Handle application command interactions"""
-        if DEBUG_MODE:
-            print(f"🔧 Application command: {interaction.data}")
+    async def on_error(event, *args, **kwargs):
+        """Handle Discord errors"""
+        print(f"❌ Discord error in {event}: {args}")
 
 def run_flask():
     """Run Flask server"""
@@ -560,7 +511,7 @@ def run_bot():
         print("❌ CHANNEL_ID environment variable not set")
         return
     
-    print("🤖 Starting Discord bot with slash command support...")
+    print("🤖 Starting Discord bot...")
     try:
         bot.run(DISCORD_TOKEN)
     except Exception as e:
@@ -568,12 +519,14 @@ def run_bot():
 
 def main():
     """Main function for Render deployment"""
-    print("=" * 50)
-    print("🚀 MIDJOURNEY BRIDGE - RENDER DEPLOYMENT (SLASH COMMANDS)")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 MIDJOURNEY BRIDGE - RENDER DEPLOYMENT v2.0")
+    print("=" * 60)
     print(f"🔧 Discord Available: {DISCORD_AVAILABLE}")
     print(f"🔧 Token Set: {bool(DISCORD_TOKEN)}")
     print(f"🔧 Channel ID: {CHANNEL_ID}")
+    print(f"🔧 Max Wait Time: {MAX_WAIT_MINUTES} minutes")
+    print(f"🔧 Debug Mode: {DEBUG_MODE}")
     
     if not DISCORD_AVAILABLE:
         print("⚠️ Running in Flask-only mode")
